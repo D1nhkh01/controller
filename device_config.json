@@ -1,0 +1,88 @@
+{
+  "devices": {
+    "BOARD_RELAY": {
+      "com_port": "COM9",
+      "baud_rate": 9600,
+      "slave_id": 1,
+      "read_settings": {
+        "start_address": 129,
+        "num_registers": 8,
+        "interval_ms": 500
+      }
+    },
+    "SOFTWARE_COMMAND": {
+      "com_port": "COM8",
+      "baud_rate": 9600,
+      "protocol": "ascii",
+      "xonxoff": true,
+      "emit_options": {
+        "debounce_ms": 0,
+        "edge_only": false,
+        "min_interval_ms": 0
+      },
+      "default_append": "<CR>",
+      "dry_run": false,
+      "dry_run_complete_ms": 3000,
+      "print_mode": "hex_ascii",
+      "templates": {
+        "HOME": "%H<CR>",
+        "RESET": "<0x1D>",
+        "SET_SEQUENCE": "%S{index}_[{body}]<CR>",
+        "SET_JOB": "%J{index}_[{text}]<CR>",
+        "START_JOB": "%J{index}_N<CR>",
+        "START_SEQUENCE": "%S{index}_N<CR>"
+      },
+      "dry_run_payload_hex": "1F"
+    }
+  },
+  "zeromq": {
+    "rep_bind": "tcp://*:5555",
+    "rcv_timeout_ms": 1000,
+    "snd_timeout_ms": 1000,
+    "pub_bind": "tcp://*:5556",
+    "publish": true
+  },
+  "app": {
+    "position": {
+      "x_index": 0,
+      "y_index": 1,
+      "scale": 0.01
+    }
+  },
+  "logging": {
+    "level": "info",
+    "timestamps": true,
+    "console": true,
+    "show_prompt": false
+  },
+  "timeouts": {
+    "sc_complete_ms": 5000,
+    "ui_op_timeout_ms": 20000,
+    "get_job_ms": 4000
+  },
+  "timeout_estimation": {
+    "base_overhead_s": 3.0,
+    "per_char_mm_factor": 2.0,
+    "pitch_weight": 1.0,
+    "buffer_ratio": 0.25,
+    "min_ms": 5000,
+    "max_ms": 120000,
+    "default_speed_mm_per_min": 1000.0,
+    "default_pitch_mm": 3.0,
+    "default_size_mm": 3.0
+  },
+  "relay_actions": {
+    "on_send_pulse": {
+      "relay": 1,
+      "pulse_ms": 1000
+    },
+    "hold_during_op": {
+      "relay": 2,
+      "on": true
+    },
+    "on_complete_pulse": {
+      "relay": 3,
+      "pulse_ms": 200
+    }
+  }
+}
