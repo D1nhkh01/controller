@@ -8,10 +8,23 @@
         "start_address": 129,
         "num_registers": 8,
         "interval_ms": 500
+      },
+      "dry_run": true,
+      "dry_run_state": {
+        "ready": 1,
+        "home": 0,
+        "reset": 0,
+        "other_registers": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
       }
     },
     "SOFTWARE_COMMAND": {
-      "com_port": "COM8",
+      "com_port": null,
       "baud_rate": 9600,
       "protocol": "ascii",
       "xonxoff": true,
@@ -21,7 +34,7 @@
         "min_interval_ms": 0
       },
       "default_append": "<CR>",
-      "dry_run": false,
+      "dry_run": true,
       "dry_run_complete_ms": 3000,
       "print_mode": "hex_ascii",
       "templates": {

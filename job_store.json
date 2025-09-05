@@ -1,82 +1,41 @@
 {
   "jobs": {
     "1": {
+      "Id": "156751664750d6bc2fd0249a",
+      "CreatedAt": "2025-09-04T01:06:29Z",
+      "LastRunAt": "2025-09-04T01:16:29Z",
       "JobNumber": 1,
-      "CharacterString": "TEST123",
-      "waitComplete": true,
-      "updatedAt": "2025-08-21T03:24:29Z",
-      "Id": "60ebdd3c65eadd2ea390fe9e",
-      "CreatedAt": "2025-08-21T08:40:40Z",
-      "LastRunAt": "2025-08-22T03:26:30Z",
-      "JobName": "",
-      "StartX": 0.0,
-      "StartY": 0.0,
+      "JobName": "test job 1",
+      "CharacterString": "helo",
+      "StartX": 23.5,
+      "StartY": 14.0,
       "PitchX": 0.0,
       "PitchY": 0.0,
-      "Size": 1.0,
-      "Speed": 100,
+      "Size": 5.0,
+      "Speed": 1000,
       "Direction": 0,
       "Increment": null,
       "Calendar": null,
-      "CircularMarking": null
-    },
-    "5": {
-      "Id": "0632bc7435da8b7817645cdb",
-      "CreatedAt": "2025-08-22T04:06:54Z",
-      "LastRunAt": "2025-08-22T04:06:54Z",
-      "JobNumber": 5,
-      "JobName": "",
-      "CharacterString": "",
-      "StartX": 0.0,
-      "StartY": 0.0,
-      "PitchX": 0.0,
-      "PitchY": 0.0,
-      "Size": 1.0,
-      "Speed": 100,
-      "Direction": 0,
-      "Increment": null,
-      "Calendar": null,
-      "CircularMarking": null
-    },
-    "6": {
-      "Id": "e87cb29ec7f9327796e272ed",
-      "CreatedAt": "2025-08-22T04:12:19Z",
-      "LastRunAt": "2025-08-22T04:12:19Z",
-      "JobNumber": 6,
-      "JobName": "",
-      "CharacterString": "",
-      "StartX": 0.0,
-      "StartY": 0.0,
-      "PitchX": 0.0,
-      "PitchY": 0.0,
-      "Size": 1.0,
-      "Speed": 100,
-      "Direction": 0,
-      "Increment": null,
-      "Calendar": null,
-      "CircularMarking": null
+      "CircularMarking": null,
+      "_raw_tail": [
+        "0.1",
+        "0.0",
+        "0.0",
+        "{00}",
+        "{00}",
+        "{00}",
+        "0",
+        "0.0",
+        "0.0",
+        "0.0",
+        "0.0",
+        "0.0",
+        "0.0",
+        "N",
+        "1",
+        "\"test job 1\""
+      ]
     }
   },
-  "sequences": {
-    "1": {
-      "index": 1,
-      "commandString": "H/J5/H",
-      "updatedAt": "2025-08-22T03:39:25Z"
-    },
-    "0": {
-      "index": 0,
-      "commandString": "H/J5/H",
-      "updatedAt": "2025-08-22T03:36:22Z"
-    },
-    "6": {
-      "index": 6,
-      "commandString": "H/J5/H",
-      "updatedAt": "2025-08-22T04:10:53Z"
-    },
-    "5": {
-      "index": 5,
-      "commandString": "H/J5/H",
-      "updatedAt": "2025-08-22T04:10:32Z"
-    }
-  }
+  "sequences": {}
 }
