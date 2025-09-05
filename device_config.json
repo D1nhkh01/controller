@@ -52,8 +52,8 @@
     "rep_bind": "tcp://*:5555",
     "rcv_timeout_ms": 1000,
     "snd_timeout_ms": 1000,
-    "pub_bind": "tcp://*:5556",
-    "publish": true
+    "pub_bind": null,
+    "publish": false
   },
   "app": {
     "position": {

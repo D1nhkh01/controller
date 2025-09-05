@@ -16,6 +16,14 @@ from datetime import datetime, timezone
 import zmq
 import random
 
+# Seq logging integration
+try:
+    from logger_setup import setup_logging, get_logger, log_vm2030_command, log_relay_operation, log_zmq_request, log_serial_error
+    _HAS_SEQ_LOGGER = True
+except ImportError:
+    _HAS_SEQ_LOGGER = False
+    print("Warning: logger_setup not found. Seq logging disabled.")
+
 # -----------------------------
 # Files & Globals
 # -----------------------------
@@ -26,6 +34,9 @@ ser = None              # BOARD_RELAY (Modbus)
 ser_cmd = None          # SOFTWARE_COMMAND -> VM2030
 cmd_queue = None        # queue to writer
 ser_lock = threading.Lock()     # lock cho BOARD_RELAY
+
+# Seq logging
+seq_logger = None       # Seq logger instance
 
 # SC RX state
 sc_rx_lock = threading.Lock()   # lock cho VM2030 RX cache/buffer
@@ -72,17 +83,46 @@ def _log_enabled(level):
     except:
         return True
 
-def log(level, msg):
+def log(level, msg, **extra):
+    global seq_logger
     if not _log_enabled(level): return
+    
+    # Console logging (existing)
     if config.get("logging", {}).get("console", True):
         prefix = f"[{level.upper()}]"
         if config.get("logging", {}).get("timestamps", True):
             prefix = f"[{_ts_local()}] {prefix}"
         print(f"{prefix} {msg}")
+    
+    # Seq logging với structured data
+    if seq_logger and _HAS_SEQ_LOGGER:
+        try:
+            # Luôn thêm Signal và metadata cơ bản
+            seq_extra = {
+                "Signal": "vm2030_controller",
+                "Application": "IndustrialController", 
+                "Component": "VM2030Controller",
+                "DeviceType": "VM2030LaserMarker",
+                **extra  # User-provided extra data
+            }
+            
+            log_func = getattr(seq_logger, level.lower(), seq_logger.info)
+            log_func(msg, extra=seq_extra)
+        except Exception as e:
+            print(f"[SEQ ERROR] {e}")
 
 def log_json(level, obj):
+    global seq_logger
     if _log_enabled(level) and config.get("logging", {}).get("console", True):
         print(json.dumps(obj, ensure_ascii=False))
+    
+    # Seq logging cho JSON objects
+    if seq_logger and _HAS_SEQ_LOGGER:
+        try:
+            log_func = getattr(seq_logger, level.lower(), seq_logger.info)
+            log_func("JSON data", extra={"JsonData": obj, "DataType": "JSON"})
+        except Exception as e:
+            print(f"[SEQ ERROR] {e}")
 
 def _ok(corr_id, message):
     return {"CorrelationId": corr_id, "IsError": False, "ErrorMessage": "", "Message": message}
@@ -125,7 +165,12 @@ def encode_ascii_with_tokens(text: str) -> bytes:
         if ch == "<":
             j = text.find(">", i+1)
             if j == -1:
-                out.extend(ch.encode("latin1", errors="ignore")); i += 1; continue
+                # Sử dụng UTF-8 thay vì latin1 để hỗ trợ Unicode
+                try:
+                    out.extend(ch.encode("utf-8"))
+                except UnicodeEncodeError:
+                    out.extend(ch.encode("ascii", errors="replace"))
+                i += 1; continue
             token = text[i+1:j].strip(); up = token.upper()
             if up in _TOKEN_MAP:
                 out.extend(_TOKEN_MAP[up])
@@ -136,10 +181,18 @@ def encode_ascii_with_tokens(text: str) -> bytes:
                 if not (0 <= val <= 255): raise ValueError(f"dec token out of range: <{token}>")
                 out.append(val)
             else:
-                out.extend(("<"+token+">").encode("latin1", errors="ignore"))
+                try:
+                    out.extend(("<"+token+">").encode("utf-8"))
+                except UnicodeEncodeError:
+                    out.extend(("<"+token+">").encode("ascii", errors="replace"))
             i = j + 1
         else:
-            out.extend(ch.encode("latin1", errors="ignore")); i += 1
+            # Sử dụng UTF-8 để hỗ trợ ký tự tiếng Việt
+            try:
+                out.extend(ch.encode("utf-8"))
+            except UnicodeEncodeError:
+                out.extend(ch.encode("ascii", errors="replace"))
+            i += 1
     return bytes(out)
 
 def ensure_even_before_cr(payload: bytes) -> bytes:
@@ -205,7 +258,7 @@ def load_config():
                 }
             }
         },
-        "zeromq": {"rep_bind":"tcp://*:5555","rcv_timeout_ms":1000,"snd_timeout_ms":1000,"pub_bind":"tcp://*:5556","publish":True},
+        "zeromq": {"rep_bind":"tcp://*:5555","rcv_timeout_ms":1000,"snd_timeout_ms":1000,"pub_bind":None,"publish":False},
         "app": { "position": { "x_index": 0, "y_index": 1, "scale": 0.01 } },
         "logging": { "level": "info", "timestamps": True, "console": True, "show_prompt": False },
         "timeouts": {
@@ -352,16 +405,36 @@ def read_holding_registers(slave_id, start_addr, num_registers):
         return vals
     except serial.SerialException as e:
         # USB disconnected, port not available, etc.
-        return {"error": "serial_exception", "message": f"Serial communication error: {str(e)}"}
+        error_msg = f"Serial communication error: {str(e)}"
+        if seq_logger and _HAS_SEQ_LOGGER:
+            log_serial_error(seq_logger, device="BOARD_RELAY", 
+                           error_type="serial_exception", error_msg=str(e),
+                           function="read_holding_registers", slave_id=slave_id)
+        return {"error": "serial_exception", "message": error_msg}
     except serial.SerialTimeoutException as e:
         # Timeout - device not responding
-        return {"error": "timeout", "message": f"Communication timeout: {str(e)}"}
+        error_msg = f"Communication timeout: {str(e)}"
+        if seq_logger and _HAS_SEQ_LOGGER:
+            log_serial_error(seq_logger, device="BOARD_RELAY",
+                           error_type="timeout", error_msg=str(e),
+                           function="read_holding_registers", slave_id=slave_id)
+        return {"error": "timeout", "message": error_msg}
     except OSError as e:
         # OS level error - port disappeared, permission denied, etc.
-        return {"error": "os_error", "message": f"OS error: {str(e)}"}
+        error_msg = f"OS error: {str(e)}"
+        if seq_logger and _HAS_SEQ_LOGGER:
+            log_serial_error(seq_logger, device="BOARD_RELAY",
+                           error_type="os_error", error_msg=str(e),
+                           function="read_holding_registers", slave_id=slave_id)
+        return {"error": "os_error", "message": error_msg}
     except Exception as e:
         # Other unexpected errors
-        return {"error": "unknown", "message": f"Unexpected error: {str(e)}"}
+        error_msg = f"Unexpected error: {str(e)}"
+        if seq_logger and _HAS_SEQ_LOGGER:
+            log_serial_error(seq_logger, device="BOARD_RELAY",
+                           error_type="unknown", error_msg=str(e),
+                           function="read_holding_registers", slave_id=slave_id)
+        return {"error": "unknown", "message": error_msg}
 
 def control_single_relay(slave_id, relay_addr, state_value, retries=2, tx_delay_s=0.02):
     """
@@ -375,10 +448,22 @@ def control_single_relay(slave_id, relay_addr, state_value, retries=2, tx_delay_
     if ser is None and config["devices"]["BOARD_RELAY"].get("dry_run", False):
         state_name = "ON" if state_value == 1 else "OFF" if state_value == 2 else f"CODE_{state_value}"
         log("info", f"[BOARD_RELAY DRY_RUN] Relay {relay_addr} -> {state_name}")
+        
+        # Log đến Seq
+        if seq_logger and _HAS_SEQ_LOGGER:
+            log_relay_operation(seq_logger, relay_id=relay_addr, state=state_name, 
+                               dry_run=True, slave_id=slave_id)
+        
         return {"ok": True, "dry_run": True}
     
     if ser is None:
         return {"ok": False, "error": "Serial connection not available"}
+        
+    # Log relay operation đến Seq
+    if seq_logger and _HAS_SEQ_LOGGER:
+        state_name = "ON" if state_value == 1 else "OFF" if state_value == 2 else f"CODE_{state_value}"
+        log_relay_operation(seq_logger, relay_id=relay_addr, state=state_name,
+                           slave_id=slave_id, retries=retries, dry_run=False)
         
     frame = [slave_id, 0x10, 0x00, relay_addr, 0x00, 0x01, 0x02, state_value, 0x00]
     frame += list(calculate_crc(frame))
@@ -600,21 +685,29 @@ def _sc_dump_bytes(b: bytes):
     if mode in ("hex","hex_ascii","ascii_hex"):
         hx = b.hex(" ").upper()
         if mode == "hex":
-            log("info", f"[SC TX] {hx}")
+            log("info", f"[SC TX] {hx}",
+                OperationType="SerialTX", Device="SOFTWARE_COMMAND", 
+                HexData=hx, DataLength=len(b))
         else:
             try:
                 asc = "".join((chr(x) if 32<=x<=126 else ".") for x in b)
             except:
                 asc = ""
-            log("info", f"[SC TX] HEX: {hx} | ASCII: {asc}")
+            log("info", f"[SC TX] HEX: {hx} | ASCII: {asc}",
+                OperationType="SerialTX", Device="SOFTWARE_COMMAND",
+                HexData=hx, ASCIIData=asc, DataLength=len(b))
     elif mode == "ascii":
         try:
             asc = b.decode("latin1", errors="replace")
         except:
             asc = str(b)
-        log("info", f"[SC TX] {asc}")
+        log("info", f"[SC TX] {asc}",
+            OperationType="SerialTX", Device="SOFTWARE_COMMAND",
+            ASCIIData=asc, DataLength=len(b))
     else:
-        log("info", f"[SC TX] {b.hex(' ').upper()}")
+        log("info", f"[SC TX] {b.hex(' ').upper()}",
+            OperationType="SerialTX", Device="SOFTWARE_COMMAND",
+            HexData=b.hex(' ').upper(), DataLength=len(b))
 
 def send_raw_to_software_command(raw_bytes: bytes, repeat=1, delay_ms=0):
     global cmd_queue, ser_cmd, config
@@ -782,9 +875,13 @@ def _normalize_spaces(t: str) -> str:
 
 def _extract_job_no_from_header(header_bytes: bytes, fallback: int | None) -> int:
     try:
-        s = header_bytes.decode("latin1", "ignore")
-    except:
-        s = ""
+        # Thử UTF-8 trước, nếu không được thì dùng latin1
+        s = header_bytes.decode("utf-8", "replace")
+    except UnicodeDecodeError:
+        try:
+            s = header_bytes.decode("latin1", "ignore")
+        except:
+            s = ""
     m = re.search(r"%J\s*(\d+)\s*_B", s, flags=re.IGNORECASE)
     return int(m.group(1)) if m else int(fallback or 1)
 
@@ -804,7 +901,12 @@ def parse_vm2030_job_body(body_bytes: bytes, job_no: int) -> tuple[dict, list[st
     body_bytes: 'J 15_  2.0_0_  2400_   0.0_   0.0_   0.0_   0.0_  ... _""'
     Trả về (model, tail_tokens). Tail là các token sau 8 trường chính, gồm cả token tên job (cuối).
     """
-    s = body_bytes.decode("latin1", "ignore").replace("\r", "").strip()
+    # Thử decode UTF-8 trước, nếu không được thì dùng latin1
+    try:
+        s = body_bytes.decode("utf-8", "replace").replace("\r", "").strip()
+    except UnicodeDecodeError:
+        s = body_bytes.decode("latin1", "ignore").replace("\r", "").strip()
+    
     parts = [p.strip() for p in s.split("_") if p is not None]
 
     def get(idx, default=""):
@@ -846,6 +948,16 @@ def parse_vm2030_job_body(body_bytes: bytes, job_no: int) -> tuple[dict, list[st
 # -----------------------------
 def exec_sc_operation(op_id:str, command:str, raw:bytes, source:str, meta:dict=None, wait=True):
     meta = meta or {}
+
+    # Log VM2030 command đến Seq
+    if seq_logger and _HAS_SEQ_LOGGER:
+        log_vm2030_command(seq_logger, 
+                          command=command,
+                          job_number=meta.get("job_number"),
+                          operation_id=op_id,
+                          source=source,
+                          data_length=len(raw),
+                          wait_for_complete=wait)
 
     # GIỮ NGUYÊN VỊ TRÍ GỌI
     _relay_side_effects_on_send()
@@ -1169,8 +1281,14 @@ def handle_envelope(envelope):
                     *tail[:-1],
                     f"\"{s_job.get('JobName','')}\""
                 ])
-                header_bytes = f"%J{idx}_B\r".encode("latin1")
-                body_bytes   = body_str.encode("latin1")
+                try:
+                    header_bytes = f"%J{idx}_B\r".encode("utf-8", errors="replace")
+                    body_bytes   = body_str.encode("utf-8", errors="replace")
+                except UnicodeEncodeError:
+                    # Fallback: remove non-ASCII characters
+                    safe_body = body_str.encode("ascii", errors="ignore").decode("ascii")
+                    header_bytes = f"%J{idx}_B\r".encode("ascii")
+                    body_bytes   = safe_body.encode("ascii")
                 send_raw_to_software_command(raw_cmd)
                 sc_schedule_dryrun_complete()
                 _ = sc_wait_complete(tout)
@@ -1362,10 +1480,44 @@ def zmq_rep_server(stop_event, cfg):
             except Exception as e:
                 log("error", f"[ZMQ] recv error: {e}"); continue
             try:
-                cmd = json.loads(raw.decode("utf-8"))
-                print (f"[ZMQ] REQ → {json.dumps(cmd, ensure_ascii=False)}")
+                raw_json = raw.decode("utf-8")
+                cmd = json.loads(raw_json)
+                
+                # Log ZMQ request đến Seq với structured data
+                if seq_logger and _HAS_SEQ_LOGGER:
+                    log_zmq_request(seq_logger, 
+                                   command=cmd.get("command", "unknown"),
+                                   message_id=cmd.get("messageId", "unknown"),
+                                   payload_size=len(raw_json),
+                                   target_device=cmd.get("targetDevice", "unknown"))
+                
+                # Log nguyên mẫu JSON nhận được từ UI (console)
+                log("info", f"[ZMQ] Raw JSON received: {raw_json}",
+                    RequestType="ZMQOperation", 
+                    ZMQRequest=True,
+                    Command=cmd.get("command", "unknown"),
+                    MessageID=cmd.get("messageId", "unknown"),
+                    PayloadSize=len(raw_json),
+                    ClientRequest=True)
+                log("info", f"[ZMQ] Parsed command: {json.dumps(cmd, ensure_ascii=False, indent=2)}",
+                    RequestType="ZMQOperation",
+                    ZMQParsed=True,
+                    Command=cmd.get("command", "unknown"))
+                
                 reply = handle_envelope(cmd if isinstance(cmd, dict) else {})
-                sock.send_string(json.dumps(reply, ensure_ascii=False))
+                reply_json = json.dumps(reply, ensure_ascii=False)
+                
+                # Log response gửi về UI (console + Seq)
+                log("info", f"[ZMQ] Response sent: {reply_json}", 
+                    RequestType="ZMQOperation",
+                    ZMQResponse=True, 
+                    MessageID=cmd.get("messageId", "unknown"),
+                    IsError=reply.get("IsError", False),
+                    Command=cmd.get("command", "unknown"),
+                    ResponseSize=len(reply_json),
+                    ProcessingSuccess=True)
+                
+                sock.send_string(reply_json)
                 if isinstance(cmd, dict): log("debug", f"RPC handled: {cmd.get('command') or 'unknown'}")
             except Exception as e:
                 corr = str(uuid.uuid4())
@@ -1384,15 +1536,45 @@ def zmq_rep_server(stop_event, cfg):
 # Main
 # -----------------------------
 if __name__ == "__main__":
+    # Setup Seq logging trước tiên
+    if _HAS_SEQ_LOGGER:
+        try:
+            print("🔄 Setting up Seq logging...")
+            globals()['seq_logger'] = setup_logging(level="INFO")
+            print("✅ Seq logging initialized successfully")
+        except Exception as e:
+            print(f"⚠️  Seq logging setup failed: {e}")
+            print(f"⚠️  Error details: {type(e).__name__}: {str(e)}")
+            print("Continuing with console logging only...")
+            globals()['seq_logger'] = None
+    else:
+        print("⚠️  Seq logger not available - using console logging only")
+        print("⚠️  Make sure 'pip install seqlog' is installed")
+        globals()['seq_logger'] = None
+    
     config = load_config()
     setup_com_ports(config)
+
+    # Log application startup đến Seq
+    if seq_logger:
+        seq_logger.info("VM2030 Controller application started", extra={
+            "Signal": "vm2030_controller",
+            "Application": "IndustrialController",
+            "Component": "VM2030Controller", 
+            "DeviceType": "VM2030LaserMarker",
+            "ApplicationEvent": "Startup",
+            "Version": "1.0.0",
+            "ConfigFile": CONFIG_FILE,
+            "StartupTimestamp": _iso_now()
+        })
 
     # Open BOARD_RELAY
     dev = config["devices"]["BOARD_RELAY"]
     ser = None
     
     if dev.get("dry_run", False):
-        log("info", "BOARD_RELAY dry run mode - no actual connection needed")
+        log("info", "BOARD_RELAY dry run mode - no actual connection needed",
+            ApplicationEvent="DeviceSetup", Device="BOARD_RELAY", DryRun=True)
         ser = None
     else:
         if not dev.get("com_port"):
@@ -1401,9 +1583,15 @@ if __name__ == "__main__":
         try:
             ser = serial.Serial(dev["com_port"], dev.get("baud_rate",9600), parity=serial.PARITY_NONE,
                                 stopbits=serial.STOPBITS_ONE, timeout=1)
-            log("info", f"Kết nối tới {dev['com_port']} (BOARD_RELAY) thành công.")
+            log("info", f"Kết nối tới {dev['com_port']} (BOARD_RELAY) thành công.",
+                ApplicationEvent="DeviceSetup", Device="BOARD_RELAY", 
+                COMPort=dev["com_port"], BaudRate=dev.get("baud_rate",9600),
+                ConnectionSuccess=True)
         except Exception as e:
-            log("error", f"Lỗi mở cổng {dev.get('com_port')}: {e}"); exit(1)
+            log("error", f"Lỗi mở cổng {dev.get('com_port')}: {e}",
+                ApplicationEvent="DeviceSetup", Device="BOARD_RELAY",
+                COMPort=dev.get("com_port"), ConnectionError=str(e))
+            exit(1)
 
     # Open SOFTWARE_COMMAND (VM2030) — optional when dry_run=true
     sc_cfg = config["devices"]["SOFTWARE_COMMAND"]
