@@ -38,6 +38,9 @@ ser_lock = threading.Lock()     # lock cho BOARD_RELAY
 # Seq logging
 seq_logger = None       # Seq logger instance
 
+# Relay error tracking
+_relay_errors = []      # Track relay errors during operations
+
 # SC RX state
 sc_rx_lock = threading.Lock()   # lock cho VM2030 RX cache/buffer
 sc_rx_cv = threading.Condition(sc_rx_lock)
@@ -106,7 +109,9 @@ def log(level, msg, **extra):
                 **extra  # User-provided extra data
             }
             
-            log_func = getattr(seq_logger, level.lower(), seq_logger.info)
+            # Map deprecated 'warn' to 'warning'
+            level_mapped = "warning" if level.lower() == "warn" else level.lower()
+            log_func = getattr(seq_logger, level_mapped, seq_logger.info)
             log_func(msg, extra=seq_extra)
         except Exception as e:
             print(f"[SEQ ERROR] {e}")
@@ -136,7 +141,7 @@ def publish(topic: str, obj: dict):
     try:
         pub_socket.send_multipart([topic.encode("utf-8"), json.dumps(obj, ensure_ascii=False).encode("utf-8")])
     except Exception as e:
-        log("error", f"[ZMQ] PUB send error: {e}")
+        log("error", f"[CONTROLLER] PUB send error: {e}")
 
 # ---- Mongo-like ObjectId generator (24 hex) ----
 def new_object_id() -> str:
@@ -585,6 +590,7 @@ def _relay_on(relay, on):
     res = control_single_relay(slave, relay, state)
     if not res.get("ok"):
         log("warn", f"[RELAY] set {relay}={on} failed: {res.get('error')}")
+    return res
 
 def _relay_pulse(relay, pulse_ms):
     _relay_on(relay, True)
@@ -595,26 +601,36 @@ def _relay_side_effects_on_send():
     (MỚI) Khi bắt đầu gửi lệnh xuống máy:
       - BẬT DOING (R2) và giữ ON cho đến khi có kết quả.
     """
-    _relay_on(2, True)   # R2 = DOING ON
+    global _relay_errors
+    _relay_errors.clear()  # Clear previous errors
+    
+    result = _relay_on(2, True)   # R2 = DOING ON
+    if not result.get("ok", True):
+        _relay_errors.append(f"Failed to turn on DOING relay: {result.get('error', 'Unknown error')}")
 
 def _relay_side_effects_on_complete():
     """
     Hoàn thành: tắt DOING (R2) + bật FINISH (R3) ngay trong 1 khung,
     sau đó 1s thì tắt R3.
     """
+    global _relay_errors
     dev = config["devices"]["BOARD_RELAY"]
     slave = dev.get("slave_id", 1)
 
     # 1 khung FC16: R2=OFF (2), R3=ON (1)
     res = control_multi_relays(slave, 2, [2, 1])
     if not res.get("ok"):
-        log("warn", f"[RELAY] R2 OFF + R3 ON (simul) failed: {res.get('error')}")
+        error_msg = f"R2 OFF + R3 ON (simul) failed: {res.get('error')}"
+        log("warn", f"[RELAY] {error_msg}")
+        _relay_errors.append(error_msg)
 
     # Hẹn giờ 1s rồi tắt R3
     def _off_r3():
         r = control_single_relay(slave, 3, 2)  # 2 = OFF/CLOSE
         if not r.get("ok"):
-            log("warn", f"[RELAY] R3 OFF after pulse failed: {r.get('error')}")
+            error_msg = f"R3 OFF after pulse failed: {r.get('error')}"
+            log("warn", f"[RELAY] {error_msg}")
+            _relay_errors.append(error_msg)
     threading.Timer(1.0, _off_r3).start()
 
 # -----------------------------
@@ -646,6 +662,11 @@ def sc_build_start_sequence(seq_index:int):
 def sc_build_get_job_info(job_index:int):
     # %J{index}_B<CR>  (tải thông tin job cụ thể, trả 2 segment)
     return ensure_even_before_cr(encode_ascii_with_tokens(f"%J{int(job_index)}_B<CR>"))
+
+def sc_build_toggle_echo(echo_enabled:bool):
+    # %E_{0|1}<CR> - 0: Tắt echo, 1: Bật echo
+    echo_param = "1" if echo_enabled else "0"
+    return ensure_even_before_cr(encode_ascii_with_tokens(f"%E_{echo_param}<CR>"))
 
 # ----- set-job body builder (round-trip) -----
 def _fmt1(v) -> str:
@@ -975,12 +996,25 @@ def exec_sc_operation(op_id:str, command:str, raw:bytes, source:str, meta:dict=N
     if res.get("ok"):
         # GIỮ NGUYÊN VỊ TRÍ GỌI
         _relay_side_effects_on_complete()
+        
+        # Check for relay errors and include in response
+        global _relay_errors
+        has_relay_errors = len(_relay_errors) > 0
+        
         publish("op_result", {
             "type": "op_result",
             "opId": op_id, "command": command, "ok": True,
-            "code": res["code"], "timestamp": _iso_now(), "source": source, "meta": meta
+            "code": res["code"], "timestamp": _iso_now(), "source": source, "meta": meta,
+            "relay_errors": _relay_errors.copy() if has_relay_errors else []
         })
-        return {"ok": True, "code": res["code"], "timeoutMs": tout}
+        
+        # Return success for VM2030 but include relay error info
+        result = {"ok": True, "code": res["code"], "timeoutMs": tout}
+        if has_relay_errors:
+            result["relay_errors"] = _relay_errors.copy()
+            result["has_relay_errors"] = True
+        
+        return result
     else:
         # >>> THÊM DÒNG NÀY: timeout thì tắt DOING, KHÔNG bật alarm nào
         _relay_on(2, False)  # R2 = DOING OFF
@@ -1056,13 +1090,13 @@ def background_read(stop_event, last_values, error_count, device_config):
             ctx = zmq.Context.instance()
             psock = ctx.socket(zmq.PUB); psock.sndtimeo = 1000
             psock.bind(zmq_cfg["pub_bind"])
-            log("info", f"[ZMQ] PUB bound at {zmq_cfg['pub_bind']}")
+            log("info", f"[CONTROLLER] PUB bound at {zmq_cfg['pub_bind']}")
             time.sleep(0.3)
             globals()["pub_socket"] = psock
         else:
             globals()["pub_socket"] = None
     except Exception as e:
-        log("error", f"[ZMQ] PUB init error: {e}")
+        log("error", f"[CONTROLLER] PUB init error: {e}")
         globals()["pub_socket"] = None
 
     # Edge detection for Home/Reset
@@ -1201,7 +1235,12 @@ def handle_envelope(envelope):
             raw = sc_build_home() if state == "rt_home" else sc_build_reset()
             result = exec_sc_operation(message_id, state.upper(), raw, "ui", {"state": state}, wait=True)
             if result.get("ok"):
-                return _ok(message_id, {"state": state, "Sent": _sent_repr(raw)})
+                # Check if there were relay errors even though VM2030 operation succeeded
+                if result.get("has_relay_errors", False):
+                    error_msg = f"VM2030 operation succeeded but relay errors occurred: {'; '.join(result.get('relay_errors', []))}"
+                    return _err(message_id, error_msg)
+                else:
+                    return _ok(message_id, {"state": state, "Sent": _sent_repr(raw)})
             else:
                 return _err(message_id, f"Timeout {result.get('timeoutMs',0)} ms (lastCode={result.get('lastCode')})")
         except Exception as e:
@@ -1358,6 +1397,23 @@ def handle_envelope(envelope):
         except Exception as e:
             return _err(message_id, f"START_SEQUENCE error: {e}")
 
+    # ----------------- TOGGLE_ECHO -----------------
+    if cmd == "TOGGLE_ECHO":
+        echo_enabled = payload.get("echo_enabled", False)
+        if not _is_ready_now(): return _err(message_id, "NOT_READY")
+        err = _ensure_sc_available_or_err(message_id)
+        if err: return err
+        try:
+            raw = sc_build_toggle_echo(echo_enabled)
+            result = exec_sc_operation(message_id, "TOGGLE_ECHO", raw, "ui", {"echo_enabled": echo_enabled}, wait=True)
+            if result.get("ok"):
+                echo_status = "enabled" if echo_enabled else "disabled"
+                return _ok(message_id, {"echo_enabled": echo_enabled, "status": f"Echo {echo_status}", "Sent": _sent_repr(raw)})
+            else:
+                return _err(message_id, f"Timeout {result.get('timeoutMs',0)} ms (lastCode={result.get('lastCode')})")
+        except Exception as e:
+            return _err(message_id, f"TOGGLE_ECHO error: {e}")
+
     # ----------------- START_JOB -----------------
     if cmd == "START_JOB":
         idx = int(payload.get("index", 1))
@@ -1469,7 +1525,7 @@ def zmq_rep_server(stop_event, cfg):
     sock.RCVTIMEO = int(cfg.get("zeromq",{}).get("rcv_timeout_ms",1000))
     sock.SNDTIMEO = int(cfg.get("zeromq",{}).get("snd_timeout_ms",1000))
     sock.bind(rep_bind)
-    log("info", f"[ZMQ] REP server bound at {rep_bind}")
+    log("info", f"[CONTROLLER] REP server bound at {rep_bind}")
     try:
         while not stop_event.is_set():
             raw = None
@@ -1478,7 +1534,7 @@ def zmq_rep_server(stop_event, cfg):
             except zmq.Again:
                 continue
             except Exception as e:
-                log("error", f"[ZMQ] recv error: {e}"); continue
+                log("error", f"[CONTROLLER] recv error: {e}"); continue
             try:
                 raw_json = raw.decode("utf-8")
                 cmd = json.loads(raw_json)
@@ -1492,14 +1548,14 @@ def zmq_rep_server(stop_event, cfg):
                                    target_device=cmd.get("targetDevice", "unknown"))
                 
                 # Log nguyên mẫu JSON nhận được từ UI (console)
-                log("info", f"[ZMQ] Raw JSON received: {raw_json}",
+                log("info", f"[CONTROLLER] Raw JSON received: {raw_json}",
                     RequestType="ZMQOperation", 
                     ZMQRequest=True,
                     Command=cmd.get("command", "unknown"),
                     MessageID=cmd.get("messageId", "unknown"),
                     PayloadSize=len(raw_json),
                     ClientRequest=True)
-                log("info", f"[ZMQ] Parsed command: {json.dumps(cmd, ensure_ascii=False, indent=2)}",
+                log("info", f"[CONTROLLER] Parsed command: {json.dumps(cmd, ensure_ascii=False, indent=2)}",
                     RequestType="ZMQOperation",
                     ZMQParsed=True,
                     Command=cmd.get("command", "unknown"))
@@ -1508,7 +1564,7 @@ def zmq_rep_server(stop_event, cfg):
                 reply_json = json.dumps(reply, ensure_ascii=False)
                 
                 # Log response gửi về UI (console + Seq)
-                log("info", f"[ZMQ] Response sent: {reply_json}", 
+                log("info", f"[CONTROLLER] Response sent: {reply_json}", 
                     RequestType="ZMQOperation",
                     ZMQResponse=True, 
                     MessageID=cmd.get("messageId", "unknown"),
