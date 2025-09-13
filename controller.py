@@ -268,12 +268,12 @@ def ensure_even_before_cr(payload: bytes) -> bytes:
     if payload.endswith(b"\r\n"):
         core = payload[:-2]
         if (len(core) + 2) % 2 == 1:
-            return core + b"\n\r\n"[-2:]
+            return core + b"\r\n"[-2:]
         return payload
     if payload.endswith(b"\r"):
         core = payload[:-1]
         if (len(core) + 1) % 2 == 1:
-            return core + b"\n\r"
+            return core + b"\r"
         return payload
     return payload
 
@@ -725,6 +725,24 @@ def sc_build_toggle_echo(echo_enabled:bool):
     # %E_{0|1}<CR> - 0: Tắt echo, 1: Bật echo
     echo_param = "1" if echo_enabled else "0"
     return ensure_even_before_cr(encode_ascii_with_tokens(f"%E_{echo_param}<CR>"))
+
+# Build move axis command for VM2030 (moved here from top)
+def build_move_axis_command(axis: str, value: float) -> bytes:
+    """
+    Xây dựng lệnh di chuyển trục X hoặc Y cho VM2030:
+    - axis: 'X' hoặc 'Y'
+    - value: float, mm (X: -80.0~+80.0, Y: -30.0~+30.0)
+    """
+    axis = axis.upper()
+    if axis not in ("X", "Y"):
+        raise ValueError("Axis must be 'X' or 'Y'")
+    if axis == "X" and not (-80.0 <= value <= 80.0):
+        raise ValueError("X value out of range (-80.0~80.0)")
+    if axis == "Y" and not (-30.0 <= value <= 30.0):
+        raise ValueError("Y value out of range (-30.0~30.0)")
+    # Format: %P_X{value}<CR> hoặc %P_Y{value}<CR>
+    cmd = f"%P_{axis}{value:.1f}<CR>"
+    return ensure_even_before_cr(encode_ascii_with_tokens(cmd))
 
 # ----- set-job body builder (round-trip) -----
 def _fmt1(v) -> str:
@@ -1279,14 +1297,47 @@ def background_read(stop_event, last_values, error_count, device_config):
 # RPC (ZeroMQ REP)
 # -----------------------------
 def handle_envelope(envelope):
+    # Di chuyển các biến này lên đầu để tránh lỗi sử dụng trước khi gán giá trị
     store = _load_store()
     message_id = envelope.get("messageId") or str(uuid.uuid4())
     cmd = (envelope.get("command") or "").upper().strip()
     payload = envelope.get("payload") or {}
 
-    # Health check
-    if envelope.get("read") is True:
-        return _ok(message_id, {"note":"background reader running"})
+    # ----------------- MOVE_AXIS -----------------
+    if cmd == "MOVE_AXIS":
+        axis = str(payload.get("axis", "")).upper()
+        value = payload.get("value")
+        if axis not in ("X", "Y"):
+            return _err(message_id, "Axis must be 'X' or 'Y'")
+        # Thêm log để kiểm tra giá trị value
+        log("debug", f"[MOVE_AXIS] Received axis={axis}, value={value}")
+        
+        # Kiểm tra và ánh xạ giá trị từ distance nếu value không tồn tại
+        value = payload.get("value")
+        if value is None:
+            value = payload.get("distance")
+
+        if value is None:
+            log("error", f"[MOVE_AXIS] Missing value in payload: {payload}")
+            return _err(message_id, "Value is missing in the payload")
+
+        try:
+            value = float(value)
+        except ValueError as ve:
+            log("error", f"[MOVE_AXIS] Invalid value: {value}. Error: {ve}")
+            return _err(message_id, f"Value must be a number. Received: {value}")
+        except Exception as e:
+            log("error", f"[MOVE_AXIS] Unexpected error when parsing value: {e}")
+            return _err(message_id, "Unexpected error occurred while parsing value")
+        try:
+            raw = build_move_axis_command(axis, value)
+            result = exec_sc_operation(message_id, f"MOVE_{axis}", raw, "ui", {"axis": axis, "value": value}, wait=True)
+            if result.get("ok"):
+                return _ok(message_id, {"axis": axis, "value": value, "Sent": _sent_repr(raw)})
+            else:
+                return _err(message_id, f"Timeout {result.get('timeoutMs',0)} ms (lastCode={result.get('lastCode')})")
+        except Exception as e:
+            return _err(message_id, f"MOVE_AXIS error: {e}")
 
     # ----------------- BUILTIN (HOME / RESET) -----------------
     if cmd == "BUILTIN_COMMAND":
@@ -1469,6 +1520,7 @@ def handle_envelope(envelope):
         if err: return err
         try:
             raw = sc_build_toggle_echo(echo_enabled)
+           
             result = exec_sc_operation(message_id, "TOGGLE_ECHO", raw, "ui", {"echo_enabled": echo_enabled}, wait=True)
             if result.get("ok"):
                 echo_status = "enabled" if echo_enabled else "disabled"
@@ -1729,7 +1781,7 @@ if __name__ == "__main__":
         except Exception as e:
             log("error", f"Lỗi mở cổng {dev.get('com_port')}: {e}",
                 ApplicationEvent="DeviceSetup", Device="BOARD_RELAY",
-                COMPort=dev.get("com_port"), ConnectionError=str(e))
+                COMPort=dev.get('com_port'), ConnectionError=str(e))
             exit(1)
 
     # Open SOFTWARE_COMMAND (VM2030) — optional when dry_run=true
