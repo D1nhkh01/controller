@@ -10,7 +10,7 @@ server.py — VM2030 + PLC + Board Relay + ZeroMQ
 - GET_JOB: send %J{n}_B<CR>, collect 2 segments (header + body), normalize to JobCncModel.
 """
 import serial, serial.tools.list_ports
-import time, json, os, threading, re, uuid
+import time, json, os, threading, re, uuid, argparse
 from queue import Queue
 from datetime import datetime, timezone
 import zmq
@@ -47,15 +47,82 @@ sc_rx_cv = threading.Condition(sc_rx_lock)
 _last_status_code = {"code": None, "ts": None}  # last byte (0x1F on complete)
 _sc_rx_buffer = bytearray()      # buffer thu ASCII cho các lệnh GET/UPLOAD
 
-pub_socket = None       # global PUB socket
-
 LOG_LEVELS = {"off":0, "error":1, "warn":2, "info":3, "debug":4}
 
-# ===== VM2030 body tail mặc định sau 8 trường chính =====
-# (khớp với ví dụ bạn đưa, có thể đổi khi có spec đầy đủ)
 DEFAULT_JOB_TAIL = [
-    "0.1","0.0","0.0","{00}","{00}","{00}","0","0.0","0.0","0.0","0.0","0.0","0.0","N","1","\"\""
+    "0.1","0.0","0.0","<NUL>","<NUL>","<NUL>","0","0.0","0.0","0.0","0.0","0.0","0.0","N","1","\"\""
 ]
+
+# -----------------------------
+# Command Line Arguments
+# -----------------------------
+def parse_arguments():
+    """Parse command line arguments for dry run modes"""
+    parser = argparse.ArgumentParser(
+        description="VM2030 Controller - Laser Marking Machine Controller",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python controller.py                    # Normal mode (use config.json settings)
+  python controller.py --dry-run         # Both devices in dry run mode
+  python controller.py --dry-run-relay   # Only BOARD_RELAY in dry run mode  
+  python controller.py --dry-run-command # Only SOFTWARE_COMMAND in dry run mode
+  python controller.py --dry-run --log-level debug # Dry run với debug logging
+        """
+    )
+    
+    parser.add_argument('--dry-run', 
+                       action='store_true',
+                       help='Enable dry run mode for both BOARD_RELAY and SOFTWARE_COMMAND')
+    
+    parser.add_argument('--dry-run-relay', 
+                       action='store_true', 
+                       help='Enable dry run mode for BOARD_RELAY only')
+    
+    parser.add_argument('--dry-run-command', 
+                       action='store_true',
+                       help='Enable dry run mode for SOFTWARE_COMMAND only')
+    
+    parser.add_argument('--log-level',
+                       choices=['off', 'error', 'warn', 'info', 'debug'],
+                       help='Set logging level (overrides config.json)')
+    
+    parser.add_argument('--seq-url',
+                       help='Seq server URL (overrides environment variable)')
+    
+    parser.add_argument('--config',
+                       default=CONFIG_FILE,
+                       help=f'Config file path (default: {CONFIG_FILE})')
+    
+    return parser.parse_args()
+
+def apply_cli_overrides(config, args):
+    """Apply command line argument overrides to config"""
+    # Dry run overrides
+    if args.dry_run:
+        print("CLI Override: Enabling dry run for both devices")
+        config["devices"]["BOARD_RELAY"]["dry_run"] = True
+        config["devices"]["SOFTWARE_COMMAND"]["dry_run"] = True
+        
+    if args.dry_run_relay:
+        print("CLI Override: Enabling dry run for BOARD_RELAY")
+        config["devices"]["BOARD_RELAY"]["dry_run"] = True
+        
+    if args.dry_run_command:
+        print("CLI Override: Enabling dry run for SOFTWARE_COMMAND") 
+        config["devices"]["SOFTWARE_COMMAND"]["dry_run"] = True
+    
+    # Log level override
+    if args.log_level:
+        print(f"CLI Override: Setting log level to {args.log_level}")
+        config["logging"]["level"] = args.log_level
+        
+    # Seq URL override
+    if args.seq_url:
+        print(f"CLI Override: Setting Seq URL to {args.seq_url}")
+        os.environ["SEQ_URL"] = args.seq_url
+        
+    return config
 
 # -----------------------------
 # Small helpers
@@ -134,14 +201,6 @@ def _ok(corr_id, message):
 
 def _err(corr_id, msg):
     return {"CorrelationId": corr_id, "IsError": True, "ErrorMessage": str(msg), "Message": {}}
-
-def publish(topic: str, obj: dict):
-    global pub_socket
-    if pub_socket is None: return
-    try:
-        pub_socket.send_multipart([topic.encode("utf-8"), json.dumps(obj, ensure_ascii=False).encode("utf-8")])
-    except Exception as e:
-        log("error", f"[CONTROLLER] PUB send error: {e}")
 
 # ---- Mongo-like ObjectId generator (24 hex) ----
 def new_object_id() -> str:
@@ -225,6 +284,8 @@ def _ascii_with_tokens(b: bytes) -> str:
             out.append("<CR>")
         elif x == 0x0A:
             out.append("<LF>")
+        elif x == 0x00:
+            out.append("<NUL>")
         elif 32 <= x <= 126:
             out.append(chr(x))
         else:
@@ -232,6 +293,7 @@ def _ascii_with_tokens(b: bytes) -> str:
     return "".join(out)
 
 def _sent_repr(raw: bytes) -> dict:
+    # Dùng _ascii_with_tokens để format đúng các ký tự đặc biệt
     return {"ascii": _ascii_with_tokens(raw), "hex": raw.hex(" ").upper()}
 
 # -----------------------------
@@ -241,7 +303,7 @@ def get_available_ports():
     ports = serial.tools.list_ports.comports()
     return [{"device": p.device, "description": p.description, "hwid": p.hwid} for p in ports]
 
-def load_config():
+def load_config(config_file_path=CONFIG_FILE):
     default_config = {
         "devices": {
             "BOARD_RELAY": {
@@ -263,7 +325,7 @@ def load_config():
                 }
             }
         },
-        "zeromq": {"rep_bind":"tcp://*:5555","rcv_timeout_ms":1000,"snd_timeout_ms":1000,"pub_bind":None,"publish":False},
+        "zeromq": {"rep_bind":"tcp://*:5555","rcv_timeout_ms":1000,"snd_timeout_ms":1000},
         "app": { "position": { "x_index": 0, "y_index": 1, "scale": 0.01 } },
         "logging": { "level": "info", "timestamps": True, "console": True, "show_prompt": False },
         "timeouts": {
@@ -273,11 +335,11 @@ def load_config():
         }
     }
     cfg={}
-    if os.path.exists(CONFIG_FILE):
+    if os.path.exists(config_file_path):
         try:
-            with open(CONFIG_FILE,"r",encoding="utf-8") as f: cfg=json.load(f)
+            with open(config_file_path,"r",encoding="utf-8") as f: cfg=json.load(f)
         except Exception as e:
-            print(f"Lỗi đọc file cấu hình: {e}"); cfg={}
+            print(f"Lỗi đọc file cấu hình {config_file_path}: {e}"); cfg={}
     def deep_merge(dst, src):
         for k,v in src.items():
             if isinstance(v, dict) and isinstance(dst.get(k), dict): deep_merge(dst[k], v)
@@ -325,12 +387,12 @@ def setup_com_ports(cfg):
     if not board_relay_dry_run:
         list_and_pick("BOARD_RELAY")
     else:
-        log("info", "[BOARD_RELAY] Dry run mode enabled - no COM port needed")
+        log("debug", "[BOARD_RELAY] Dry run mode enabled - no COM port needed")
         
     if not software_command_dry_run:
         list_and_pick("SOFTWARE_COMMAND")
     else:
-        log("info", "[SOFTWARE_COMMAND] Dry run mode enabled - no COM port needed")
+        log("debug", "[SOFTWARE_COMMAND] Dry run mode enabled - no COM port needed")
     
     br = cfg["devices"]["BOARD_RELAY"].get("com_port")
     sc = cfg["devices"]["SOFTWARE_COMMAND"].get("com_port")
@@ -342,7 +404,7 @@ def open_serial_for(device_key, cfg):
     
     # Kiểm tra dry_run trước
     if dev.get("dry_run", False):
-        log("info", f"[{device_key}] Dry run mode - no actual serial connection needed")
+        log("debug", f"[{device_key}] Dry run mode - no actual serial connection needed")
         return None
         
     port = dev.get("com_port"); baud = int(dev.get("baud_rate",9600))
@@ -353,7 +415,7 @@ def open_serial_for(device_key, cfg):
                               timeout=1, xonxoff=bool(dev.get("xonxoff", True)))
         else:
             s = serial.Serial(port, baud, parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=1)
-        log("info", f"[{device_key}] Kết nối tới {port} ({baud}bps) thành công.")
+        log("debug", f"[{device_key}] Kết nối tới {port} ({baud}bps) thành công.")
         return s
     except Exception as e:
         log("error", f"[{device_key}] Lỗi mở cổng {port}: {e}"); return None
@@ -452,7 +514,7 @@ def control_single_relay(slave_id, relay_addr, state_value, retries=2, tx_delay_
     # Dry run mode
     if ser is None and config["devices"]["BOARD_RELAY"].get("dry_run", False):
         state_name = "ON" if state_value == 1 else "OFF" if state_value == 2 else f"CODE_{state_value}"
-        log("info", f"[BOARD_RELAY DRY_RUN] Relay {relay_addr} -> {state_name}")
+        log("debug", f"[BOARD_RELAY DRY_RUN] Relay {relay_addr} -> {state_name}")
         
         # Log đến Seq
         if seq_logger and _HAS_SEQ_LOGGER:
@@ -524,7 +586,7 @@ def control_multi_relays(slave_id, start_relay_addr, state_codes, retries=2, tx_
             relay_num = start_relay_addr + i
             state_name = {1:"OPEN", 2:"CLOSE", 3:"TOGGLE", 4:"LATCH", 5:"MOMENTARY"}.get(code, f"CODE_{code}")
             relay_info.append(f"R{relay_num}={state_name}")
-        log("info", f"[BOARD_RELAY DRY_RUN] Multi-relay: {', '.join(relay_info)}")
+        log("debug", f"[BOARD_RELAY DRY_RUN] Multi-relay: {', '.join(relay_info)}")
         return {"ok": True, "dry_run": True}
     
     if ser is None:
@@ -643,10 +705,6 @@ def sc_build_reset():
     # RESET là 0x1D (một byte), không CR
     return encode_ascii_with_tokens("<0x1D>")
 
-def sc_build_set_job(job_index:int, text:str):
-    # %J{index}_[{text}]<CR>
-    return ensure_even_before_cr(encode_ascii_with_tokens(f"%J{int(job_index)}_{text}<CR>"))
-
 def sc_build_set_sequence(seq_index:int, cmd_string:str):
     # %S{index}_[{cmd_string}]<CR>
     return ensure_even_before_cr(encode_ascii_with_tokens(f"%S{int(seq_index)}_{cmd_string}<CR>"))
@@ -675,28 +733,54 @@ def _fmt1(v) -> str:
     except:
         return str(v)
 
-def build_job_body_from_payload(idx: int, payload: dict, cached_tail: list[str] | None) -> str:
+def build_vm2030_set_job_command(job_number: int, payload: dict, cached_tail: list[str] = None) -> bytes:
+    """
+    Tạo lệnh SET_JOB chuẩn VM2030 theo đúng cấu trúc:
+    %J{job}_size_spare_speed_startX_startY_spacingX_spacingY_pitch_arcX_arcY_incFlag_arcFlag_calFlag_incDigits_p1x_p1y_p2x_p2y_p3x_p3y_zeroPad_orientation_"text"suffix<CR>
+    
+    Example: %J020_2.3_0_500_33.5_10.0_2.2_0.0_0.1_0.0_0.0_{00}_{00}_{00}_1_0.0_0.0_0.0_0.0_0.0_0.0_N_1_"ABC"
+    """
+    # Format số với 1 chữ số thập phân
+    def fmt_float(val):
+        return f"{float(val):.1f}"
+    
+    # Clean character string - bỏ underscore và normalize spaces
     character = re.sub(r"\s+", " ", str(payload.get("CharacterString", ""))).strip().replace("_", " ")
-    size      = _fmt1(payload.get("Size", 1.0))
-    direction = str(int(float(payload.get("Direction", 0))))
-    speed     = str(int(float(payload.get("Speed", 100))))
-    start_x   = _fmt1(payload.get("StartX", 0.0))
-    start_y   = _fmt1(payload.get("StartY", 0.0))
-    pitch_x   = _fmt1(payload.get("PitchX", 0.0))
-    pitch_y   = _fmt1(payload.get("PitchY", 0.0))
-
+    
+    # Thay thế flag thành <NUL> cho format ASCII
+    def process_flag(flag):
+        if flag == "<NUL>" or flag is None:
+            return "<NUL>"
+        return str(flag)
+    
+    # Sử dụng tail từ cache hoặc default (16 thông số mở rộng)
     tail = list(cached_tail) if cached_tail and len(cached_tail) > 0 else list(DEFAULT_JOB_TAIL)
-    job_name = str(payload.get("JobName", ""))
     if len(tail) == 0:
         tail = list(DEFAULT_JOB_TAIL)
-    tail[-1] = f"\"{job_name}\""
-
-    head = [character, size, direction, speed, start_x, start_y, pitch_x, pitch_y]
-    return "_".join(head + tail)
-
-def sc_build_set_job_body(job_index: int, body: str) -> bytes:
-    # %J{index}_{body}<CR>
-    return ensure_even_before_cr(encode_ascii_with_tokens(f"%J{int(job_index)}_{body}<CR>"))
+    
+    # Xây dựng các thành phần theo đúng thứ tự VM2030
+    params = [
+        fmt_float(payload.get("Size", 1.0)),                    # Character size
+        str(int(float(payload.get("Direction", 0)))),          # Spare  
+        str(int(float(payload.get("Speed", 100)))),            # Marking speed
+        fmt_float(payload.get("StartX", 0.0)),                 # Marking start point X
+        fmt_float(payload.get("StartY", 0.0)),                 # Marking start point Y  
+        fmt_float(payload.get("PitchX", 0.0)),                 # Character spacing X
+        fmt_float(payload.get("PitchY", 0.0)),                 # Character spacing Y
+    ]
+    
+    # Thêm 16 tail parameters từ DEFAULT_JOB_TAIL (bỏ phần tử cuối là "")
+    params.extend(tail[:-1])
+    
+    # Character string ở cuối với format text"" (không có quotes đầu)
+    character_suffix = f'{character}""'
+    params.append(character_suffix)
+    
+    # Tạo command string
+    body = "_".join(params)
+    command = f"%J{job_number:03d}_{body}<CR>"
+    
+    return ensure_even_before_cr(encode_ascii_with_tokens(command))
 
 # -----------------------------
 # VM2030 writer/reader + dry-run / print
@@ -706,15 +790,25 @@ def _sc_dump_bytes(b: bytes):
     if mode in ("hex","hex_ascii","ascii_hex"):
         hx = b.hex(" ").upper()
         if mode == "hex":
-            log("info", f"[SC TX] {hx}",
+            log("warn", f"[SC TX] {hx}",
                 OperationType="SerialTX", Device="SOFTWARE_COMMAND", 
                 HexData=hx, DataLength=len(b))
         else:
-            try:
-                asc = "".join((chr(x) if 32<=x<=126 else ".") for x in b)
-            except:
-                asc = ""
-            log("info", f"[SC TX] HEX: {hx} | ASCII: {asc}",
+            # Dùng format giống _sent_repr để consistency
+            asc = ""
+            for x in b:
+                if 32 <= x <= 126:
+                    asc += chr(x)
+                elif x == 0x0D:
+                    asc += "<CR>"
+                elif x == 0x0A:
+                    asc += "<LF>"
+                elif x == 0x00:
+                    asc += "<NUL>"
+                else:
+                    asc += f"<0x{x:02X}>"
+                    
+            log("warn", f"[SC TX] HEX: {hx} | ASCII: {asc}",
                 OperationType="SerialTX", Device="SOFTWARE_COMMAND",
                 HexData=hx, ASCIIData=asc, DataLength=len(b))
     elif mode == "ascii":
@@ -1001,12 +1095,7 @@ def exec_sc_operation(op_id:str, command:str, raw:bytes, source:str, meta:dict=N
         global _relay_errors
         has_relay_errors = len(_relay_errors) > 0
         
-        publish("op_result", {
-            "type": "op_result",
-            "opId": op_id, "command": command, "ok": True,
-            "code": res["code"], "timestamp": _iso_now(), "source": source, "meta": meta,
-            "relay_errors": _relay_errors.copy() if has_relay_errors else []
-        })
+        # No more publishing - only REP responses
         
         # Return success for VM2030 but include relay error info
         result = {"ok": True, "code": res["code"], "timeoutMs": tout}
@@ -1019,12 +1108,7 @@ def exec_sc_operation(op_id:str, command:str, raw:bytes, source:str, meta:dict=N
         # >>> THÊM DÒNG NÀY: timeout thì tắt DOING, KHÔNG bật alarm nào
         _relay_on(2, False)  # R2 = DOING OFF
 
-        publish("op_result", {
-            "type": "op_result",
-            "opId": op_id, "command": command, "ok": False,
-            "isTimeout": True, "timeoutMs": tout, "lastCode": res.get("code"),
-            "timestamp": _iso_now(), "source": source, "meta": meta
-        })
+        # No more publishing - timeout handled in response
         return {"ok": False, "isTimeout": True, "lastCode": res.get("code"), "timeoutMs": tout}
 
 def _ensure_sc_available_or_err(message_id):
@@ -1082,23 +1166,8 @@ def attempt_reconnect_relay():
 # Background reader (Relay) + Input edges
 # -----------------------------
 def background_read(stop_event, last_values, error_count, device_config):
-    global pub_socket, config
-    # Prepare PUB
-    try:
-        zmq_cfg = config.get("zeromq", {})
-        if zmq_cfg.get("publish", True) and zmq_cfg.get("pub_bind"):
-            ctx = zmq.Context.instance()
-            psock = ctx.socket(zmq.PUB); psock.sndtimeo = 1000
-            psock.bind(zmq_cfg["pub_bind"])
-            log("info", f"[CONTROLLER] PUB bound at {zmq_cfg['pub_bind']}")
-            time.sleep(0.3)
-            globals()["pub_socket"] = psock
-        else:
-            globals()["pub_socket"] = None
-    except Exception as e:
-        log("error", f"[CONTROLLER] PUB init error: {e}")
-        globals()["pub_socket"] = None
-
+    global config
+    
     # Edge detection for Home/Reset
     last_emit_time = {}
     debounce_ms = int(config["devices"]["SOFTWARE_COMMAND"].get("emit_options", {}).get("debounce_ms", 100))
@@ -1171,8 +1240,7 @@ def background_read(stop_event, last_values, error_count, device_config):
                                     "values":values,"timestamp":ts}
                         summary  = make_state_summary(values, device_config, config, ts)
                         log_json("debug", response); log_json("info", summary)
-                        publish("read_response", response)
-                        publish("soft_state", summary)
+                        # No more publishing - only log the states
 
                         if prev is not None:
                             old_home = 1 if prev[idx_home] else 0
@@ -1204,11 +1272,8 @@ def background_read(stop_event, last_values, error_count, device_config):
                     log("error", f"[BOARD_RELAY] Background read error: {str(e)}")
                 time.sleep(1)
     finally:
-        sock = globals().get("pub_socket")
-        if sock is not None:
-            try: sock.close(0)
-            except: pass
-        globals()["pub_socket"] = None
+        # No more PUB socket cleanup needed
+        pass
 
 # -----------------------------
 # RPC (ZeroMQ REP)
@@ -1257,8 +1322,7 @@ def handle_envelope(envelope):
             if str(idx) in store.get("jobs", {}):
                 cached_tail = store["jobs"][str(idx)].get("_raw_tail")
 
-            body_str = build_job_body_from_payload(idx, payload, cached_tail)
-            raw = sc_build_set_job_body(idx, body_str)
+            raw = build_vm2030_set_job_command(idx, payload, cached_tail)
 
             job_id = _ensure_job_id(store, idx)
             now_iso = _iso_now()
@@ -1525,7 +1589,7 @@ def zmq_rep_server(stop_event, cfg):
     sock.RCVTIMEO = int(cfg.get("zeromq",{}).get("rcv_timeout_ms",1000))
     sock.SNDTIMEO = int(cfg.get("zeromq",{}).get("snd_timeout_ms",1000))
     sock.bind(rep_bind)
-    log("info", f"[CONTROLLER] REP server bound at {rep_bind}")
+    log("debug", f"[CONTROLLER] REP server bound at {rep_bind}")
     try:
         while not stop_event.is_set():
             raw = None
@@ -1547,31 +1611,27 @@ def zmq_rep_server(stop_event, cfg):
                                    payload_size=len(raw_json),
                                    target_device=cmd.get("targetDevice", "unknown"))
                 
-                # Log nguyên mẫu JSON nhận được từ UI (console)
-                log("info", f"[CONTROLLER] Raw JSON received: {raw_json}",
+                # Log JSON request từ UI
+                log("warn", f"[CONTROLLER] JSON Request: {raw_json}",
                     RequestType="ZMQOperation", 
                     ZMQRequest=True,
                     Command=cmd.get("command", "unknown"),
                     MessageID=cmd.get("messageId", "unknown"),
                     PayloadSize=len(raw_json),
                     ClientRequest=True)
-                log("info", f"[CONTROLLER] Parsed command: {json.dumps(cmd, ensure_ascii=False, indent=2)}",
-                    RequestType="ZMQOperation",
-                    ZMQParsed=True,
-                    Command=cmd.get("command", "unknown"))
                 
                 reply = handle_envelope(cmd if isinstance(cmd, dict) else {})
                 reply_json = json.dumps(reply, ensure_ascii=False)
                 
-                # Log response gửi về UI (console + Seq)
-                log("info", f"[CONTROLLER] Response sent: {reply_json}", 
-                    RequestType="ZMQOperation",
-                    ZMQResponse=True, 
-                    MessageID=cmd.get("messageId", "unknown"),
-                    IsError=reply.get("IsError", False),
-                    Command=cmd.get("command", "unknown"),
-                    ResponseSize=len(reply_json),
-                    ProcessingSuccess=True)
+                # Response được gửi về client (không log trong dry-run)
+                # log("warn", f"[CONTROLLER] Response sent: {reply_json}", 
+                #     RequestType="ZMQOperation",
+                #     ZMQResponse=True, 
+                #     MessageID=cmd.get("messageId", "unknown"),
+                #     IsError=reply.get("IsError", False),
+                #     Command=cmd.get("command", "unknown"),
+                #     ResponseSize=len(reply_json),
+                #     ProcessingSuccess=True)
                 
                 sock.send_string(reply_json)
                 if isinstance(cmd, dict): log("debug", f"RPC handled: {cmd.get('command') or 'unknown'}")
@@ -1592,11 +1652,22 @@ def zmq_rep_server(stop_event, cfg):
 # Main
 # -----------------------------
 if __name__ == "__main__":
+    # Parse CLI arguments
+    args = parse_arguments()
+    
+    print("VM2030 Controller Starting...")
+    print(f"📁 Using config file: {args.config}")
+    
+    # Load config with CLI overrides
+    config = load_config(args.config)
+    config = apply_cli_overrides(config, args)
+    
     # Setup Seq logging trước tiên
     if _HAS_SEQ_LOGGER:
         try:
             print("🔄 Setting up Seq logging...")
-            globals()['seq_logger'] = setup_logging(level="INFO")
+            log_level = config.get("logging", {}).get("level", "INFO").upper()
+            globals()['seq_logger'] = setup_logging(level=log_level)
             print("✅ Seq logging initialized successfully")
         except Exception as e:
             print(f"⚠️  Seq logging setup failed: {e}")
@@ -1608,12 +1679,24 @@ if __name__ == "__main__":
         print("⚠️  Make sure 'pip install seqlog' is installed")
         globals()['seq_logger'] = None
     
-    config = load_config()
+    # Show dry run status
+    relay_dry = config["devices"]["BOARD_RELAY"].get("dry_run", False)
+    command_dry = config["devices"]["SOFTWARE_COMMAND"].get("dry_run", False)
+    
+    if relay_dry or command_dry:
+        print("Dry Run Mode Active:")
+        if relay_dry:
+            print("  BOARD_RELAY: DRY RUN (simulated)")
+        if command_dry:
+            print("  SOFTWARE_COMMAND: DRY RUN (simulated)")
+    else:
+        print("Hardware Mode: Using real COM ports")
+    
     setup_com_ports(config)
 
-    # Log application startup đến Seq
+    # Log application startup đến Seq (chỉ khi debug)
     if seq_logger:
-        seq_logger.info("VM2030 Controller application started", extra={
+        seq_logger.debug("VM2030 Controller application started", extra={
             "Signal": "vm2030_controller",
             "Application": "IndustrialController",
             "Component": "VM2030Controller", 

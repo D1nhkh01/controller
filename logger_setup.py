@@ -3,9 +3,21 @@ import logging, os, socket, uuid, sys
 
 try:
     import seqlog
+    # Kiểm tra seqlog có bị corrupt không
+    if getattr(seqlog, '__version__', 'Unknown') == 'Unknown' or len([x for x in dir(seqlog) if not x.startswith('_')]) == 0:
+        raise ImportError("Seqlog corrupted")
     _HAS_SEQ = True
+    _SEQLOG_MODE = "real"
 except Exception:
-    _HAS_SEQ = False
+    try:
+        # Fallback sang seqlog_fallback nếu có
+        import seqlog_fallback as seqlog
+        _HAS_SEQ = True
+        _SEQLOG_MODE = "fallback"
+        print("⚠️  Using seqlog fallback mode")
+    except Exception:
+        _HAS_SEQ = False
+        _SEQLOG_MODE = "none"
 
 APP_NAME     = os.getenv("APP_NAME", "VM2030Controller")
 APP_VERSION  = os.getenv("APP_VERSION", "1.0.0")
@@ -55,7 +67,12 @@ def _setup_console(level: str, ctx_filter: logging.Filter):
 def _setup_seq(level: str, ctx_filter: logging.Filter):
     # Gắn seqlog vào root logger
     try:
-        print(f"DEBUG: Setting up Seq with URL: {SEQ_URL}")
+        print(f"DEBUG: Setting up Seq with URL: {SEQ_URL} (mode: {_SEQLOG_MODE})")
+        
+        if _SEQLOG_MODE == "fallback":
+            print("DEBUG: Using fallback mode - logs will go to console only")
+            _setup_console(level, ctx_filter)
+            return
         
         # Sử dụng seqlog.log_to_seq với cách đúng
         seqlog.log_to_seq(
@@ -69,23 +86,24 @@ def _setup_seq(level: str, ctx_filter: logging.Filter):
         
         # Thêm global properties theo Seq Signals best practices
         # Signal là identifier chính để group và filter logs theo hướng dẫn Seq
-        seqlog.set_global_log_properties(
-            # Core Signal properties - chính để filtering trong Seq
-            Signal=SIGNAL_TYPE,  # Primary signal: vm2030_controller
-            Application="IndustrialController",  # Application group
-            Component="VM2030Controller",  # Specific component
-            
-            # Infrastructure properties
-            Host=socket.gethostname(),
-            Environment="Development",  # Production/Staging/Development
-            Version=APP_VERSION,
-            
-            # Domain-specific properties cho VM2030 controller
-            DeviceType="VM2030LaserMarker",  # Loại thiết bị điều khiển
-            Protocol="ModbusRTU+ASCII",  # Giao thức sử dụng
-            ConnectionType="Serial+ZeroMQ",  # Phương thức kết nối
-            ProcessType="Controller"  # Loại process
-        )
+        if _SEQLOG_MODE == "real" and hasattr(seqlog, 'set_global_log_properties'):
+            seqlog.set_global_log_properties(
+                # Core Signal properties - chính để filtering trong Seq
+                Signal=SIGNAL_TYPE,  # Primary signal: vm2030_controller
+                Application="IndustrialController",  # Application group
+                Component="VM2030Controller",  # Specific component
+                
+                # Infrastructure properties
+                Host=socket.gethostname(),
+                Environment="Development",  # Production/Staging/Development
+                Version=APP_VERSION,
+                
+                # Domain-specific properties cho VM2030 controller
+                DeviceType="VM2030LaserMarker",  # Loại thiết bị điều khiển
+                Protocol="ModbusRTU+ASCII",  # Giao thức sử dụng
+                ConnectionType="Serial+ZeroMQ",  # Phương thức kết nối
+                ProcessType="Controller"  # Loại process
+            )
         
         print(f"DEBUG: Seq setup completed with Signal={SIGNAL_TYPE}")
         print(f"DEBUG: Use 'Signal == \"{SIGNAL_TYPE}\"' in Seq queries to filter VM2030 Controller logs")
@@ -124,10 +142,13 @@ def setup_logging(level: str | None = None, session_id: str | None = None) -> lo
     app_logger.setLevel(level)
     
     # Kiểm tra thực tế Seq có hoạt động không
-    seq_enabled = _HAS_SEQ and any(isinstance(h, seqlog.SeqLogHandler) for h in logging.getLogger().handlers)
+    seq_enabled = _HAS_SEQ and _SEQLOG_MODE == "real" and any(
+        hasattr(h, '__class__') and 'SeqLogHandler' in h.__class__.__name__ 
+        for h in logging.getLogger().handlers
+    )
     
-    app_logger.info("VM2030 Controller logging initialized - SEQ: %s, URL: %s, Level: %s, Session: %s, Signal: %s", 
-                    seq_enabled, SEQ_URL, level, session_id, SIGNAL_TYPE)
+    app_logger.info("VM2030 Controller logging initialized - SEQ: %s (mode: %s), URL: %s, Level: %s, Session: %s, Signal: %s", 
+                    seq_enabled, _SEQLOG_MODE, SEQ_URL, level, session_id, SIGNAL_TYPE)
     app_logger.info("Signal filter configured for Seq: Signal=%s (use this in Seq filtering)", SIGNAL_TYPE)
     return app_logger
 

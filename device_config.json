@@ -24,7 +24,7 @@
       }
     },
     "SOFTWARE_COMMAND": {
-      "com_port": null,
+      "com_port": "COM8",
       "baud_rate": 9600,
       "protocol": "ascii",
       "xonxoff": true,
@@ -63,7 +63,7 @@
     }
   },
   "logging": {
-    "level": "info",
+    "level": "warn",
     "timestamps": true,
     "console": true,
     "show_prompt": false
