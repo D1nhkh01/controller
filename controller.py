@@ -899,6 +899,7 @@ def software_command_reader(stop_event, ser_cmd_local, cfg):
             if not b:
                 time.sleep(0.01); continue
             code = b[0]
+            print(f"[SC RX] Received byte: 0x{code:02X} ({'0x1F completion' if code == 0x1F else 'data'})")
             with sc_rx_lock:
                 if code == 0x1F:
                     _last_status_code["code"] = code
@@ -950,14 +951,21 @@ def sc_read_until_complete_collect(timeout_ms:int) -> bytes:
                 return data
 
 def sc_wait_complete(timeout_ms:int):
+    print(f"[sc_wait_complete] Waiting for 0x1F, timeout={timeout_ms}ms...")
     end = time.time() + (timeout_ms/1000.0)
     last = None
+    check_count = 0
     while time.time() < end:
         with sc_rx_lock:
             last = _last_status_code["code"]
+        check_count += 1
+        if check_count % 100 == 0:  # Log every 2 seconds (100 * 0.02s)
+            print(f"[sc_wait_complete] Check #{check_count}, current code: {last}")
         if last == 0x1F:
+            print(f"[sc_wait_complete] SUCCESS: Received 0x1F after {check_count} checks")
             return {"ok": True, "code": last}
         time.sleep(0.02)
+    print(f"[sc_wait_complete] TIMEOUT: No 0x1F received, lastCode={last}")
     return {"ok": False, "code": last}
 
 # -----------------------------
@@ -1102,6 +1110,12 @@ def exec_sc_operation(op_id:str, command:str, raw:bytes, source:str, meta:dict=N
 
     # GIỮ NGUYÊN VỊ TRÍ GỌI
     _relay_side_effects_on_send()
+    
+    # CLEAR status code trước khi gửi lệnh mới
+    with sc_rx_lock:
+        _last_status_code["code"] = None
+        _last_status_code["ts"] = _ts_local()
+    
     send_raw_to_software_command(raw)
 
     if config["devices"]["SOFTWARE_COMMAND"].get("dry_run", False):
@@ -1631,10 +1645,14 @@ def handle_envelope(envelope):
         if err: return err
         try:
             raw = sc_build_start_sequence(idx)
+            print(f"[START_SEQUENCE] Sending sequence {idx}, waiting for 0x1F completion...")
+            print(f"[START_SEQUENCE] Reader thread enabled: {_reader_thread_enabled.is_set()}")
             result = exec_sc_operation(message_id, "START_SEQUENCE", raw, "ui", {"index": idx}, wait=True)
             if result.get("ok"):
+                print(f"[START_SEQUENCE] Sequence {idx} completed successfully (received 0x1F)")
                 return _ok(message_id, {"index": idx, "Sent": _sent_repr(raw)})
             else:
+                print(f"[START_SEQUENCE] Sequence {idx} timed out, lastCode={result.get('lastCode')}")
                 return _err(message_id, f"Timeout {result.get('timeoutMs',0)} ms (lastCode={result.get('lastCode')})")
         except Exception as e:
             return _err(message_id, f"START_SEQUENCE error: {e}")
