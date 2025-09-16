@@ -47,6 +47,10 @@ sc_rx_cv = threading.Condition(sc_rx_lock)
 _last_status_code = {"code": None, "ts": None}  # last byte (0x1F on complete)
 _sc_rx_buffer = bytearray()      # buffer thu ASCII cho các lệnh GET/UPLOAD
 
+# Reader thread control for GET_JOB
+_reader_thread_enabled = threading.Event()  # Controls if reader thread should process data
+_reader_thread_enabled.set()  # Default: enabled
+
 LOG_LEVELS = {"off":0, "error":1, "warn":2, "info":3, "debug":4}
 
 DEFAULT_JOB_TAIL = [
@@ -886,6 +890,11 @@ def software_command_reader(stop_event, ser_cmd_local, cfg):
     ser_cmd_local.reset_input_buffer()
     while not stop_event.is_set():
         try:
+            # Chỉ xử lý dữ liệu khi reader thread được enable
+            if not _reader_thread_enabled.is_set():
+                time.sleep(0.01)
+                continue
+                
             b = ser_cmd_local.read(1)
             if not b:
                 time.sleep(0.01); continue
@@ -1405,7 +1414,7 @@ def handle_envelope(envelope):
         except Exception as e:
             return _err(message_id, f"SET_JOB error: {e}")
 
-    # ----------------- GET_JOB (đọc 2 segment, map đủ trường) -----------------
+    # ----------------- GET_JOB (dùng logic từ test_get_job_bridge) -----------------
     if cmd == "GET_JOB":
         try:
             idx = int(payload.get("JobNumber") or payload.get("index") or 1)
@@ -1413,126 +1422,178 @@ def handle_envelope(envelope):
             if err: return err
 
             dry_run = bool(config["devices"]["SOFTWARE_COMMAND"].get("dry_run", False))
-            tout = int(config.get("timeouts",{}).get("get_job_ms", 4000))
-            raw_cmd = sc_build_get_job_info(idx)  # %J{idx}_B<CR>
-
+            
             if dry_run:
+                # Dry run - trả về dữ liệu giả từ store
                 s_job = store["jobs"].get(str(idx)) or {}
-                character = s_job.get("CharacterString", f"J {idx}")
-                size      = s_job.get("Size", 2.0)
-                direction = s_job.get("Direction", 0)
-                speed     = s_job.get("Speed", 2400)
-                start_x   = s_job.get("StartX", 0.0)
-                start_y   = s_job.get("StartY", 0.0)
-                pitch_x   = s_job.get("PitchX", 0.0)
-                pitch_y   = s_job.get("PitchY", 0.0)
-                tail      = s_job.get("_raw_tail", DEFAULT_JOB_TAIL)
-                body_str  = "_".join([
-                    _normalize_spaces(str(character)).replace("_"," "),
-                    _fmt1(size), str(direction), str(speed),
-                    _fmt1(start_x), _fmt1(start_y), _fmt1(pitch_x), _fmt1(pitch_y),
-                    *tail[:-1],
-                    f"\"{s_job.get('JobName','')}\""
-                ])
+                import random
+                fake_id = f"{random.randrange(16**24):024x}"
+                now = datetime.utcnow().isoformat() + "Z"
+                
+                reply = {
+                    "Id": fake_id,
+                    "CreatedAt": now,
+                    "LastRunAt": now, 
+                    "LastUpdated": now,
+                    "LastSyncedToDevice": now,
+                    "JobNumber": idx,
+                    "JobName": s_job.get("JobName", ""),
+                    "CharacterString": s_job.get("CharacterString", f"J {idx}"),
+                    "StartX": float(s_job.get("StartX", 0.0)),
+                    "StartY": float(s_job.get("StartY", 0.0)),
+                    "PitchX": float(s_job.get("PitchX", 0.0)),
+                    "PitchY": float(s_job.get("PitchY", 0.0)),
+                    "Size": float(s_job.get("Size", 2.0)),
+                    "Speed": int(s_job.get("Speed", 500)),
+                    "Direction": int(s_job.get("Direction", 0)),
+                    "Increment": None,
+                    "Calendar": None,
+                    "CircularMarking": None,
+                    "IsError": False,
+                    "ErrorMessage": ""
+                }
+                return _ok(message_id, reply)
+            
+            # Real mode - gửi xuống máy thật giống test_get_job_bridge.py
+            if ser_cmd:
+                # TẮT reader thread tạm thời để tránh nó ăn mất dữ liệu
+                print("[GET_JOB] Temporarily disabling reader thread...")
+                _reader_thread_enabled.clear()  # Tắt reader thread
+                
                 try:
-                    header_bytes = f"%J{idx}_B\r".encode("utf-8", errors="replace")
-                    body_bytes   = body_str.encode("utf-8", errors="replace")
-                except UnicodeEncodeError:
-                    # Fallback: remove non-ASCII characters
-                    safe_body = body_str.encode("ascii", errors="ignore").decode("ascii")
-                    header_bytes = f"%J{idx}_B\r".encode("ascii")
-                    body_bytes   = safe_body.encode("ascii")
-                send_raw_to_software_command(raw_cmd)
-                sc_schedule_dryrun_complete()
-                _ = sc_wait_complete(tout)
-            else:
-                import time
-                if ser_cmd:
-                    ser_cmd.write(raw_cmd)
+                    job_cmd = f"%J{idx}_B\r".encode("ascii")
+                    print(f"[GET_JOB] Sending command: {job_cmd}")
+                    ser_cmd.reset_input_buffer()  # Clear buffer trước khi gửi
+                    ser_cmd.write(job_cmd)
                     ser_cmd.flush()
-                    time.sleep(0.5)
-                    response = ser_cmd.read(256)
+                    print("[GET_JOB] Command sent, waiting for response...")
+                    time.sleep(1.0)  # Tăng từ 0.5s lên 1.0s
+                    response = ser_cmd.read(512)  # Tăng từ 256 lên 512 bytes
+                    
+                    # Nếu không có dữ liệu, thử đọc thêm
+                    if len(response) == 0:
+                        print("[GET_JOB] No data received, trying again...")
+                        time.sleep(0.5)
+                        response = ser_cmd.read(512)
+                    
                     print(f"[GET_JOB] Received from machine: {response}")
                     log("debug", f"[GET_JOB] Received from machine: {response}")
-                    segments = response.split(b"\x1F")
-                    if len(segments) >= 3:
-                        # Parse body
-                        body = segments[2].decode(errors="replace").replace("\r","").strip()
-                        tokens = [t.strip() for t in body.split("_")]
-                        def get(idx, default=None):
-                            return tokens[idx] if idx < len(tokens) else default
-                        # Mapping các trường
-                        # Mapping đúng chuẩn JobCncModel
-                        import datetime
-                        job_number = int(get(0,"J 0").replace("J"," ").replace(" ","").strip()) if get(0) else 0
-                        size = float(get(1,"0.0")) if get(1) else 0.0
-                        speed = int(get(3,"0")) if get(3) else 0
-                        start_x = float(get(4,"0.0")) if get(4) else 0.0
-                        start_y = float(get(5,"0.0")) if get(5) else 0.0
-                        pitch_x = float(get(6,"0.0")) if get(6) else 0.0
-                        pitch_y = float(get(7,"0.0")) if get(7) else 0.0
-                        direction_num = int(get(21,"0")) if get(21) else 0
-                        direction = direction_num
-                        character_string = get(22,"") if get(22) else ""
-                        job_id = _ensure_job_id(_load_store(), job_number)
-                        now = datetime.datetime.utcnow().isoformat() + "Z"
-                        reply = {
-                            "Id": job_id,
-                            "CreatedAt": now,
-                            "LastRunAt": now,
-                            "LastUpdated": now,
-                            "LastSyncedToDevice": now,
-                            "JobNumber": job_number,
-                            "JobName": "",
-                            "CharacterString": character_string,
-                            "StartX": start_x,
-                            "StartY": start_y,
-                            "PitchX": pitch_x,
-                            "PitchY": pitch_y,
-                            "Size": size,
-                            "Speed": speed,
-                            "Direction": direction,
-                            "Increment": None,
-                            "Calendar": None,
-                            "CircularMarking": None,
-                            "RawHex": response.hex(" ").upper(),
-                            "IsError": False,
-                            "ErrorMessage": ""
-                        }
-                        import json
-                        print("[GET_JOB] JSON Response:")
-                        print(json.dumps(reply, ensure_ascii=False, indent=2))
-                        log_json("info", reply)
-                    else:
-                        reply = {
-                            "IsError": True,
-                            "ErrorMessage": f"Không đủ dữ liệu (nhận {len(response)} bytes)",
-                            "RawHex": response.hex(" ").upper()
-                        }
-                        log_json("error", reply)
+                finally:
+                    # BẬT LẠI reader thread cho các lệnh khác
+                    print("[GET_JOB] Re-enabling reader thread...")
+                    _reader_thread_enabled.set()  # Bật lại reader thread
+                
+                # Parse segments theo 0x1F như trong bridge
+                segments = response.split(b"\x1F")
+                print(f"[DEBUG] Total segments: {len(segments)}")
+                for i, seg in enumerate(segments):
+                    print(f"[DEBUG] Segment {i}: {seg}")
+                    
+                if len(segments) >= 3:
+                    # Parse body - tìm segment chứa dữ liệu job
+                    body_segment = None
+                    for i, seg in enumerate(segments):
+                        seg_str = seg.decode(errors="replace")
+                        if "J 20" in seg_str or seg_str.count("_") > 10:  # segment chứa nhiều _ là body
+                            body_segment = seg_str
+                            print(f"[DEBUG] Using segment {i} as body: {seg_str}")
+                            break
+                    
+                    if not body_segment:
+                        body_segment = segments[2].decode(errors="replace")
+                        print(f"[DEBUG] Fallback to segment 2: {body_segment}")
+                    
+                    body = body_segment.replace("\r","").strip()
+                    tokens = [t.strip() for t in body.split("_")]
+                    # print(f"[DEBUG] Total tokens: {len(tokens)}")
+                    # for i, token in enumerate(tokens):
+                    #     print(f"[DEBUG] Token {i}: '{token}'")
+                    
+                    def get(idx, default=None):
+                        return tokens[idx] if idx < len(tokens) else default
+                        
+                    # Mapping các trường theo phân tích token đúng
+                    import datetime
+                    import random
+                    
+                    # JobNumber từ token 0: "J 20" -> 20
+                    job_header = get(0, "J 0")
+                    job_number = 0
+                    if job_header and job_header.startswith("J"):
+                        try:
+                            job_number = int(job_header[1:].strip())
+                        except:
+                            job_number = 0
+                    
+                    # Các trường số theo token index đúng
+                    size = float(get(1, "0.0")) if get(1) else 0.0
+                    # token 2 là mode/flag, skip
+                    speed = int(get(3, "0")) if get(3) else 0
+                    start_x = float(get(4, "0.0")) if get(4) else 0.0
+                    start_y = float(get(5, "0.0")) if get(5) else 0.0
+                    pitch_x = float(get(6, "0.0")) if get(6) else 0.0
+                    pitch_y = float(get(7, "0.0")) if get(7) else 0.0
+                    
+                    # Direction từ token 2
+                    direction = int(get(2, "0")) if get(2) and get(2).isdigit() else 0
+                    
+                    # DEBUG: So sánh Direction ở các vị trí khác nhau
+                    direction_token2 = int(get(2, "0")) if get(2) and get(2).isdigit() else 0
+                    direction_token21 = get(21, "")
+                    direction_token22 = get(22, "")
+                    print(f"[DEBUG] Direction comparison: token2='{direction_token2}', token21='{direction_token21}', token22='{direction_token22}'")
+                    print(f"[DEBUG] Using Direction = {direction} from token2 (consistent with SET_JOB)")
+                    
+                    # CharacterString từ token 23 (loại bỏ \r và quotes thừa)
+                    character_string = get(23, "")
+                    if character_string:
+                        # Loại bỏ \r, "" ở cuối và ký tự escape thừa
+                        character_string = character_string.replace('\r', '').replace('""', '').replace('"', '').strip()
+                    
+                    # Tạo fake ID theo yêu cầu
+                    fake_id = f"{random.randrange(16**24):024x}"
+                    now = datetime.datetime.utcnow().isoformat() + "Z"
+                    
+                    reply = {
+                        "Id": fake_id,
+                        "CreatedAt": now,
+                        "LastRunAt": now,
+                        "LastUpdated": now,
+                        "LastSyncedToDevice": now,
+                        "JobNumber": job_number,
+                        "JobName": "",
+                        "CharacterString": character_string,
+                        "StartX": start_x,
+                        "StartY": start_y,
+                        "PitchX": pitch_x,
+                        "PitchY": pitch_y,
+                        "Size": size,
+                        "Speed": speed,
+                        "Direction": direction,
+                        "Increment": None,
+                        "Calendar": None,
+                        "CircularMarking": None,
+                        "IsError": False,
+                        "ErrorMessage": ""
+                    }
+                    
+                    import json
+                    print("[GET_JOB] JSON Response:")
+                    print(json.dumps(reply, ensure_ascii=False, indent=2))
+                    log_json("info", reply)
+                    
                     return _ok(message_id, reply)
                 else:
-                    print("[GET_JOB] SOFTWARE_COMMAND serial not available")
-                    log("error", "[GET_JOB] SOFTWARE_COMMAND serial not available")
-                    return _err(message_id, "SOFTWARE_COMMAND serial not available")
-
-            job_no = _extract_job_no_from_header(header_bytes, idx)
-            model, tail_tokens = parse_vm2030_job_body(body_bytes, job_no)
-
-            # Đảm bảo Id luôn là chuỗi hex 24 ký tự
-            job_id = model.get("Id")
-            if not job_id or not isinstance(job_id, str) or len(job_id) != 24 or not all(c in "0123456789abcdef" for c in job_id.lower()):
-                job_id = _ensure_job_id(store, job_no)
-            existed = store["jobs"].get(str(job_no)) or {}
-            model["Id"] = job_id
-            model["CreatedAt"] = existed.get("CreatedAt", _iso_now())
-            model["LastRunAt"] = _iso_now()
-
-            store["jobs"][str(job_no)] = {**existed, **model,
-                                          "_raw_tail": tail_tokens if tail_tokens else DEFAULT_JOB_TAIL}
-            _save_store(store)
-
-            return _ok(message_id, {**model})
+                    reply = {
+                        "IsError": True,
+                        "ErrorMessage": f"Không đủ dữ liệu (nhận {len(response)} bytes)"
+                    }
+                    log_json("error", reply)
+                    return _err(message_id, reply["ErrorMessage"])
+            else:
+                print("[GET_JOB] SOFTWARE_COMMAND serial not available")
+                log("error", "[GET_JOB] SOFTWARE_COMMAND serial not available")
+                return _err(message_id, "SOFTWARE_COMMAND serial not available")
 
         except Exception as e:
             return _err(message_id, f"GET_JOB error: {e}")
@@ -1863,12 +1924,13 @@ if __name__ == "__main__":
     t_read_relay.start()
 
     t_sc_writer = None
-    # TẠM THỜI KHÔNG KHỞI ĐỘNG THREAD READER SOFTWARE_COMMAND ĐỂ TEST GET_JOB
-    # t_sc_reader = None
+    t_sc_reader = None
     if ser_cmd is not None:
         t_sc_writer = threading.Thread(target=software_command_writer, args=(stop_event, ser_cmd, cmd_queue, config), daemon=True)
         t_sc_writer.start()
-        # KHÔNG KHỞI ĐỘNG t_sc_reader
+        # BẬT LẠI reader thread với cơ chế control cho GET_JOB
+        t_sc_reader = threading.Thread(target=software_command_reader, args=(stop_event, ser_cmd, config), daemon=True)
+        t_sc_reader.start()
 
     t_rep = threading.Thread(target=zmq_rep_server, args=(stop_event, config), daemon=True)
     t_rep.start()
@@ -1878,7 +1940,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("info","Đang dừng chương trình...")
         stop_event.set()
-        for t in [t_read_relay, t_sc_writer, t_rep]:
+        for t in [t_read_relay, t_sc_writer, t_sc_reader, t_rep]:
             if t and hasattr(t,"is_alive") and t.is_alive(): t.join(timeout=1)
     finally:
         try:
