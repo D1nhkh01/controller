@@ -899,9 +899,14 @@ def software_command_reader(stop_event, ser_cmd_local, cfg):
             if not b:
                 time.sleep(0.01); continue
             code = b[0]
-            print(f"[SC RX] Received byte: 0x{code:02X} ({'0x1F completion' if code == 0x1F else 'data'})")
+            completion_codes = [0x1F, 0x87]  # 0x1F for normal, 0x87 for RESET
+            is_completion = code in completion_codes
+            code_desc = f"0x{code:02X} {'completion' if is_completion else 'data'}"
+            if is_completion:
+                code_desc += f" ({hex(code)} = {'normal completion' if code == 0x1F else 'reset completion'})"
+            print(f"[SC RX] Received byte: {code_desc}")
             with sc_rx_lock:
-                if code == 0x1F:
+                if is_completion:
                     _last_status_code["code"] = code
                     _last_status_code["ts"] = _ts_local()
                     sc_rx_cv.notify_all()
@@ -950,8 +955,15 @@ def sc_read_until_complete_collect(timeout_ms:int) -> bytes:
                 _sc_rx_buffer.clear()
                 return data
 
-def sc_wait_complete(timeout_ms:int):
-    print(f"[sc_wait_complete] Waiting for 0x1F, timeout={timeout_ms}ms...")
+def sc_wait_complete(timeout_ms:int, expected_codes=None):
+    """
+    Chờ completion signal từ VM2030. 
+    expected_codes: list of completion codes to wait for. Default: [0x1F, 0x87]
+    """
+    if expected_codes is None:
+        expected_codes = [0x1F, 0x87]  # 0x1F for normal commands, 0x87 for RESET
+    
+    print(f"[sc_wait_complete] Waiting for completion codes {[hex(c) for c in expected_codes]}, timeout={timeout_ms}ms...")
     end = time.time() + (timeout_ms/1000.0)
     last = None
     check_count = 0
@@ -960,12 +972,12 @@ def sc_wait_complete(timeout_ms:int):
             last = _last_status_code["code"]
         check_count += 1
         if check_count % 100 == 0:  # Log every 2 seconds (100 * 0.02s)
-            print(f"[sc_wait_complete] Check #{check_count}, current code: {last}")
-        if last == 0x1F:
-            print(f"[sc_wait_complete] SUCCESS: Received 0x1F after {check_count} checks")
+            print(f"[sc_wait_complete] Check #{check_count}, current code: {hex(last) if last else None}")
+        if last in expected_codes:
+            print(f"[sc_wait_complete] SUCCESS: Received {hex(last)} after {check_count} checks")
             return {"ok": True, "code": last}
         time.sleep(0.02)
-    print(f"[sc_wait_complete] TIMEOUT: No 0x1F received, lastCode={last}")
+    print(f"[sc_wait_complete] TIMEOUT: No completion code received, lastCode={hex(last) if last else None}")
     return {"ok": False, "code": last}
 
 # -----------------------------
