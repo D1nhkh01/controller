@@ -164,19 +164,16 @@ def log(level, msg, **extra):
             prefix = f"[{_ts_local()}] {prefix}"
         print(f"{prefix} {msg}")
     
-    # Seq logging với structured data
-    if seq_logger and _HAS_SEQ_LOGGER:
+    # Seq logging với structured data (chỉ khi seq_logging=True)
+    if seq_logger and _HAS_SEQ_LOGGER and config.get("seq_logging", True):
         try:
-            # Luôn thêm Signal và metadata cơ bản
             seq_extra = {
                 "Signal": "vm2030_controller",
                 "Application": "IndustrialController", 
                 "Component": "VM2030Controller",
                 "DeviceType": "VM2030LaserMarker",
-                **extra  # User-provided extra data
+                **extra
             }
-            
-            # Map deprecated 'warn' to 'warning'
             level_mapped = "warning" if level.lower() == "warn" else level.lower()
             log_func = getattr(seq_logger, level_mapped, seq_logger.info)
             log_func(msg, extra=seq_extra)
@@ -188,8 +185,8 @@ def log_json(level, obj):
     if _log_enabled(level) and config.get("logging", {}).get("console", True):
         print(json.dumps(obj, ensure_ascii=False))
     
-    # Seq logging cho JSON objects
-    if seq_logger and _HAS_SEQ_LOGGER:
+    # Seq logging cho JSON objects (chỉ khi seq_logging=True)
+    if seq_logger and _HAS_SEQ_LOGGER and config.get("seq_logging", True):
         try:
             log_func = getattr(seq_logger, level.lower(), seq_logger.info)
             log_func("JSON data", extra={"JsonData": obj, "DataType": "JSON"})
@@ -849,10 +846,12 @@ def send_raw_to_software_command(raw_bytes: bytes, repeat=1, delay_ms=0):
     repeat = max(1, int(repeat)); delay_ms = max(0, int(delay_ms))
     dry_run = bool(config["devices"]["SOFTWARE_COMMAND"].get("dry_run", False))
 
+    # Luôn in ra lệnh gửi xuống máy khắc (ascii/hex)
+    _sc_dump_bytes(bytes(raw_bytes))
+
     # In ra terminal luôn khi dry-run hoặc không có COM
     if dry_run or ser_cmd is None:
         for _ in range(repeat):
-            _sc_dump_bytes(bytes(raw_bytes))
             if delay_ms > 0: time.sleep(delay_ms/1000.0)
         return
 
@@ -1082,8 +1081,8 @@ def parse_vm2030_job_body(body_bytes: bytes, job_no: int) -> tuple[dict, list[st
 def exec_sc_operation(op_id:str, command:str, raw:bytes, source:str, meta:dict=None, wait=True):
     meta = meta or {}
 
-    # Log VM2030 command đến Seq
-    if seq_logger and _HAS_SEQ_LOGGER:
+    # Log VM2030 command đến Seq (chỉ khi seq_logging=True)
+    if seq_logger and _HAS_SEQ_LOGGER and config.get("seq_logging", True):
         log_vm2030_command(seq_logger, 
                           command=command,
                           job_number=meta.get("job_number"),
@@ -1655,8 +1654,8 @@ def zmq_rep_server(stop_event, cfg):
                 raw_json = raw.decode("utf-8")
                 cmd = json.loads(raw_json)
                 
-                # Log ZMQ request đến Seq với structured data
-                if seq_logger and _HAS_SEQ_LOGGER:
+                # Log ZMQ request đến Seq với structured data (chỉ khi seq_logging=True)
+                if seq_logger and _HAS_SEQ_LOGGER and config.get("seq_logging", True):
                     log_zmq_request(seq_logger, 
                                    command=cmd.get("command", "unknown"),
                                    message_id=cmd.get("messageId", "unknown"),
@@ -1746,8 +1745,8 @@ if __name__ == "__main__":
     
     setup_com_ports(config)
 
-    # Log application startup đến Seq (chỉ khi debug)
-    if seq_logger:
+    # Log application startup đến Seq (chỉ khi seq_logging=True)
+    if seq_logger and config.get("seq_logging", True):
         seq_logger.debug("VM2030 Controller application started", extra={
             "Signal": "vm2030_controller",
             "Application": "IndustrialController",

@@ -9,7 +9,7 @@
         "num_registers": 8,
         "interval_ms": 500
       },
-      "dry_run": true,
+      "dry_run": false,
       "dry_run_state": {
         "ready": 1,
         "home": 0,
@@ -34,7 +34,7 @@
         "min_interval_ms": 0
       },
       "default_append": "<CR>",
-      "dry_run": true,
+      "dry_run": false,
       "dry_run_complete_ms": 3000,
       "print_mode": "hex_ascii",
       "templates": {
@@ -63,16 +63,17 @@
     }
   },
   "logging": {
-    "level": "warn",
+    "level": "debug",
     "timestamps": true,
     "console": true,
-    "show_prompt": false
+    "show_prompt": true
   },
   "timeouts": {
     "sc_complete_ms": 5000,
     "ui_op_timeout_ms": 20000,
     "get_job_ms": 4000
   },
+  "seq_logging": true,
   "timeout_estimation": {
     "base_overhead_s": 3.0,
     "per_char_mm_factor": 2.0,
